@@ -6,6 +6,8 @@ import time
 import random
 import sys
 from datetime import datetime
+from login_gui import LoginWindow
+from chat_gui import ChatWindow
 
 @Pyro4.expose
 class ChatClient:
@@ -51,20 +53,44 @@ class ChatClient:
     
     def receive_message(self, sender, message):
         """Método remoto para receber mensagens"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{timestamp}] Mensagem de {sender}: {message}")
-        return True
+        try:
+            # Verificar se o remetente está na lista de usuários próximos
+            sender_nearby = any(user['username'] == sender for user in self.nearby_users)
+            
+            if not sender_nearby:
+                # Se não estiver próximo, a mensagem deve ir para a fila MOM
+                success, msg = self.server.send_message(sender, self.username, message)
+                print(f"Mensagem de {sender} armazenada para entrega posterior")
+                return True
+            
+            # Se estiver próximo, mostrar na interface
+            if hasattr(self, 'gui'):
+                self.gui.receive_message(sender, message)
+                return True
+            else:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                print(f"\n[{timestamp}] Mensagem de {sender}: {message}")
+                return True
+            
+        except Exception as e:
+            print(f"Erro ao receber mensagem: {e}")
+            return False
     
     def update_location(self, new_location):
         """Atualiza a localização do usuário"""
-        self.location = new_location
-        success = self.server.update_location(self.username, new_location)
-        if success:
-            print(f"Sua localização foi atualizada para {new_location}")
-            # Atualizar lista de usuários próximos após mudar de localização
-            self.refresh_nearby_users()
-        else:
-            print("Falha ao atualizar localização")
+        try:
+            self.location = new_location
+            success = self.server.update_location(self.username, new_location)
+            if success:
+                print(f"Sua localização foi atualizada para {new_location}")
+                self.refresh_nearby_users()
+                return True
+            else:
+                print("Falha ao atualizar localização")
+                return False
+        except Exception as e:
+            print(f"Erro ao atualizar localização: {e}")
+            return False
     
     def refresh_nearby_users(self):
         """Atualiza a lista de usuários próximos"""
@@ -119,94 +145,73 @@ class ChatClient:
     
     def send_message(self, recipient, message):
         """Envia mensagem para outro usuário"""
-        if recipient in self.user_proxies:
-            # Usuário está próximo, enviar diretamente
-            try:
-                proxy = self.user_proxies[recipient]
-                proxy.receive_message(self.username, message)
-                print(f"Mensagem enviada para {recipient}")
-                return True
-            except:
-                print(f"Erro ao enviar mensagem diretamente. Tentando via servidor...")
-        
-        # Tentar enviar via servidor (que decidirá se armazena na fila ou não)
-        success, msg = self.server.send_message(self.username, recipient, message)
-        print(msg)
-        return success
+        try:
+            # Verificar se o usuário está na lista de usuários próximos
+            recipient_nearby = any(user['username'] == recipient for user in self.nearby_users)
+            
+            if not recipient_nearby:
+                # Se não estiver próximo, enviar para o servidor armazenar na fila
+                success, msg = self.server.send_message(self.username, recipient, message)
+                print(msg)
+                return success
+            
+            # Se estiver próximo, tentar enviar diretamente
+            if recipient in self.user_proxies:
+                try:
+                    proxy = self.user_proxies[recipient]
+                    proxy.receive_message(self.username, message)
+                    print(f"Mensagem enviada para {recipient}")
+                    return True
+                except Exception as e:
+                    print(f"Erro ao enviar mensagem diretamente: {e}")
+                    return False
+            
+            return False
+        except Exception as e:
+            print(f"Erro no envio da mensagem: {e}")
+            return False
     
     def check_offline_messages(self):
         """Verifica se há mensagens offline para o usuário"""
         try:
             messages = self.server.get_offline_messages(self.username)
             if messages:
-                print("\n=== Mensagens recebidas enquanto você estava fora de alcance ===")
                 for msg in messages:
-                    timestamp = datetime.fromisoformat(msg['timestamp']).strftime("%d/%m/%Y %H:%M:%S")
-                    print(f"[{timestamp}] De {msg['sender']}: {msg['message']}")
-                print("=== Fim das mensagens offline ===\n")
+                    # Verificar se o remetente está próximo antes de mostrar a mensagem
+                    sender_nearby = any(user['username'] == msg['sender'] for user in self.nearby_users)
+                    
+                    if sender_nearby:
+                        if hasattr(self, 'gui'):
+                            self.gui.add_message(msg['sender'], "você", msg['message'])
+                        else:
+                            timestamp = datetime.fromisoformat(msg['timestamp']).strftime("%d/%m/%Y %H:%M:%S")
+                            print(f"[{timestamp}] De {msg['sender']}: {msg['message']}")
+                    else:
+                        # Se ainda não está próximo, devolver a mensagem para a fila
+                        self.server.store_offline_message(msg['sender'], self.username, msg['message'])
+                
+            return True
         except Exception as e:
             print(f"Erro ao verificar mensagens offline: {e}")
+            return False
 
 # Interface de linha de comando
 def main():
-    print("=== Cliente de Chat com Localização ===")
-    username = input("Digite seu nome de usuário: ")
+    # Iniciar interface gráfica de login
+    login_window = LoginWindow()
+    user_data = login_window.get_user_data()
     
-    # Gerar localização aleatória para simplificar
-    lat = float(input("Digite sua latitude: ") or random.uniform(-23.5, -23.6))
-    lng = float(input("Digite sua longitude: ") or random.uniform(-46.6, -46.7))
+    if not user_data:
+        print("Login cancelado")
+        return
     
-    initial_location = (lat, lng)
-    client = ChatClient(username, initial_location)
+    # Criar cliente com os dados do login
+    client = ChatClient(user_data['username'], user_data['location'])
     
-    print("\nComandos disponíveis:")
-    print("/users - Listar usuários próximos")
-    print("/msg <usuário> <mensagem> - Enviar mensagem")
-    print("/location <lat> <lng> - Atualizar localização")
-    print("/exit - Sair do chat")
-    
-    while True:
-        try:
-            command = input("\n> ")
-            
-            if command == "/users":
-                client.refresh_nearby_users()
-            
-            elif command.startswith("/msg "):
-                parts = command.split(" ", 2)
-                if len(parts) < 3:
-                    print("Uso: /msg <usuário> <mensagem>")
-                    continue
-                
-                recipient = parts[1]
-                message = parts[2]
-                client.send_message(recipient, message)
-            
-            elif command.startswith("/location "):
-                parts = command.split()
-                if len(parts) != 3:
-                    print("Uso: /location <lat> <lng>")
-                    continue
-                
-                try:
-                    lat = float(parts[1])
-                    lng = float(parts[2])
-                    client.update_location((lat, lng))
-                except ValueError:
-                    print("Coordenadas inválidas")
-            
-            elif command == "/exit":
-                print("Saindo do chat...")
-                break
-            
-            else:
-                print("Comando desconhecido. Digite /help para ver os comandos disponíveis.")
-        
-        except KeyboardInterrupt:
-            print("\nSaindo do chat...")
-            break
-        except Exception as e:
-            print(f"Erro: {e}")
+    # Criar e iniciar interface gráfica principal
+    chat_window = ChatWindow(client)
+    client.gui = chat_window
+    chat_window.run()
 
 if __name__ == "__main__":
     main()

@@ -97,46 +97,73 @@ class ChatServer:
     def send_message(self, sender, recipient, message):
         """Envia uma mensagem para outro usuário"""
         if recipient not in self.users:
-            # Usuário não existe
             return False, "Usuário não encontrado"
         
         sender_location = self.users[sender]['location']
         recipient_location = self.users[recipient]['location']
         
-        distance = self.calculate_distance(sender_location, recipient_location)
-        
-        if distance <= 200:
-            # Usuário está próximo, pode enviar diretamente
-            return True, "Mensagem enviada diretamente"
-        else:
-            # Usuário está longe, armazenar na fila
-            self.store_offline_message(sender, recipient, message)
-            return True, "Usuário fora de alcance. Mensagem armazenada para entrega posterior."
+        try:
+            distance = self.calculate_distance(sender_location, recipient_location)
+            
+            if distance <= 200:
+                # Usuário está próximo, pode enviar diretamente
+                return True, "Mensagem enviada diretamente"
+            else:
+                # Usuário está longe, armazenar na fila
+                self.store_offline_message(sender, recipient, message)
+                return True, "Usuário fora de alcance. Mensagem armazenada para entrega posterior."
+        except Exception as e:
+            print(f"Erro ao enviar mensagem: {e}")
+            return False, "Erro ao processar mensagem"
     
     def store_offline_message(self, sender, recipient, message):
         """Armazena mensagem offline no RabbitMQ"""
-        message_data = {
-            'sender': sender,
-            'recipient': recipient,
-            'message': message,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        self.channel.basic_publish(
-            exchange='',
-            routing_key='offline_messages',
-            body=json.dumps(message_data),
-            properties=pika.BasicProperties(
-                delivery_mode=2,  # Mensagem persistente
-            )
-        )
-        
-        # Também armazenamos localmente para facilitar a recuperação
-        if recipient not in self.offline_messages:
-            self.offline_messages[recipient] = []
-        
-        self.offline_messages[recipient].append(message_data)
-        print(f"Mensagem de {sender} para {recipient} armazenada na fila")
+        try:
+            message_data = {
+                'sender': sender,
+                'recipient': recipient,
+                'message': message,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Primeiro armazenamos localmente
+            if recipient not in self.offline_messages:
+                self.offline_messages[recipient] = []
+            
+            self.offline_messages[recipient].append(message_data)
+            
+            # Depois tentamos armazenar no RabbitMQ
+            try:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key='offline_messages',
+                    body=json.dumps(message_data),
+                    properties=pika.BasicProperties(
+                        delivery_mode=2,  # Mensagem persistente
+                    )
+                )
+            except pika.exceptions.StreamLostError:
+                # Reconectar ao RabbitMQ
+                self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+                self.channel = self.connection.channel()
+                self.channel.queue_declare(queue='offline_messages')
+                
+                # Tentar publicar novamente
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key='offline_messages',
+                    body=json.dumps(message_data),
+                    properties=pika.BasicProperties(
+                        delivery_mode=2,
+                    )
+                )
+            
+            print(f"Mensagem de {sender} para {recipient} armazenada na fila")
+            return True
+        except Exception as e:
+            print(f"Erro ao armazenar mensagem offline: {e}")
+            # Mesmo com erro no RabbitMQ, a mensagem foi salva localmente
+            return True
     
     def get_offline_messages(self, username):
         """Recupera mensagens offline para um usuário"""
