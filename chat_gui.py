@@ -17,10 +17,6 @@ class ChatWindow:
         # Criar e configurar widgets
         self.create_widgets()
         
-        # Configurar thread para atualizar mensagens
-        #self.message_thread = threading.Thread(target=self.update_messages, daemon=True)
-        #self.message_thread.start()
-        
         # Centralizar janela
         self.center_window()
         
@@ -28,6 +24,14 @@ class ChatWindow:
         # Frame principal
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Frame para botões (novo)
+        buttons_frame = ttk.Frame(main_frame)
+        buttons_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+
+        # Botão de sair
+        self.quit_button = ttk.Button(buttons_frame, text="Sair", command=self.logout)
+        self.quit_button.pack(side=tk.LEFT, padx=5)
         
         # Informações do usuário
         info_frame = ttk.LabelFrame(main_frame, text="Informações do Usuário", padding="5")
@@ -204,6 +208,16 @@ class ChatWindow:
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f'{width}x{height}+{x}+{y}')
+    
+    def logout(self):
+        """Realiza o logout do usuário"""
+        try:
+            self.client.logout()  # Novo método que vamos criar
+            self.root.quit()
+            self.root.destroy()
+        except Exception as e:
+            print(f"Erro ao fazer logout: {e}")
+            self.root.destroy()
     
     def run(self):
         self.root.mainloop()

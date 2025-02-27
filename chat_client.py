@@ -194,6 +194,21 @@ class ChatClient:
         except Exception as e:
             print(f"Erro ao verificar mensagens offline: {e}")
             return False
+    
+    def logout(self):
+        """Realiza o logout do usuário"""
+        try:
+            # Notificar o servidor
+            self.server.remove_user(self.username)
+            
+            # Parar threads
+            if hasattr(self, 'daemon'):
+                self.daemon.shutdown()
+            
+            print(f"Usuário {self.username} desconectado com sucesso")
+        except Exception as e:
+            print(f"Erro ao fazer logout: {e}")
+            raise e
 
 # Interface de linha de comando
 def main():

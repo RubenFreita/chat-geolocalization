@@ -369,6 +369,26 @@ class ChatServer:
         except Exception as e:
             print(f"Erro ao verificar conexão: {e}")
             return False
+    
+    def remove_user(self, username):
+        """Remove um usuário do sistema"""
+        try:
+            if username in self.users:
+                del self.users[username]
+                print(f"Usuário {username} removido do servidor")
+                
+                # # Limpar fila de mensagens offline
+                # queue_name = f'offline_messages.{username}'
+                # try:
+                #     self.channel.queue_delete(queue=queue_name)
+                # except:
+                #     pass  # Ignora se a fila não existir
+                
+                return True
+            return False
+        except Exception as e:
+            print(f"Erro ao remover usuário: {e}")
+            return False
 
 # Iniciar o servidor
 if __name__ == "__main__":
