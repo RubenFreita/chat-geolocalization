@@ -13,10 +13,22 @@ class ChatServer:
         self.users = {}  # {username: {location: (lat, long), last_active: timestamp, uri: pyro_uri}}
         self.offline_messages = {}  # {recipient: [messages]}
         
-        # Configuração do RabbitMQ
-        self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-        self.channel = self.connection.channel()
-        self.channel.queue_declare(queue='offline_messages')
+        if not self.setup_rabbitmq_connection():
+            raise Exception("Falha ao configurar conexão com RabbitMQ")
+        
+        try:
+            # Fazer o binding com a nova exchange
+            self.channel.queue_bind(
+                exchange='chat_exchange',
+                queue='offline_messages',
+                routing_key='offline_messages.*'
+            )
+        except Exception as e:
+            print(f"Erro ao fazer binding da fila: {e}")
+            raise e
+        
+        # Iniciar consumidor de mensagens
+        #self.setup_message_consumer()
         
         # Iniciar thread para monitorar usuários inativos
         self.monitor_thread = threading.Thread(target=self.monitor_inactive_users)
@@ -24,6 +36,49 @@ class ChatServer:
         self.monitor_thread.start()
         
         print("Servidor de chat iniciado!")
+    
+    def setup_rabbitmq_connection(self):
+        """Configura ou reconfigura a conexão com RabbitMQ"""
+        try:
+            # Parâmetros de conexão mais robustos
+            parameters = pika.ConnectionParameters(
+                host='localhost',
+                heartbeat=600,
+                blocked_connection_timeout=300,
+                connection_attempts=3,
+                retry_delay=5
+            )
+            
+            self.connection = pika.BlockingConnection(parameters)
+            self.channel = self.connection.channel()
+            
+            # Configurar prefetch para melhor distribuição de carga
+            self.channel.basic_qos(prefetch_count=1)
+            
+            try:
+                # Tentar deletar a exchange se ela existir
+                self.channel.exchange_delete(exchange='chat_exchange')
+            except:
+                pass  # Ignora erro se a exchange não existir
+            
+            # Criar uma exchange própria
+            self.channel.exchange_declare(
+                exchange='chat_exchange',
+                exchange_type='topic',
+                durable=True
+            )
+            
+            # Declarar fila padrão
+            self.channel.queue_declare(
+                queue='offline_messages',
+                durable=True
+            )
+            
+            print("Conexão com RabbitMQ estabelecida com sucesso")
+            return True
+        except Exception as e:
+            print(f"Erro ao configurar RabbitMQ: {e}")
+            return False
     
     def register_user(self, username, location, uri):
         """Registra um novo usuário no sistema"""
@@ -106,8 +161,20 @@ class ChatServer:
             distance = self.calculate_distance(sender_location, recipient_location)
             
             if distance <= 200:
-                # Usuário está próximo, pode enviar diretamente
-                return True, "Mensagem enviada diretamente"
+                # Usuário está próximo, tentar enviar diretamente
+                try:
+                    recipient_proxy = Pyro4.Proxy(self.users[recipient]['uri'])
+                    success = recipient_proxy.receive_message(sender, message)
+                    if success:
+                        return True, "Mensagem enviada diretamente"
+                    else:
+                        # Se falhar o envio direto, armazenar na fila
+                        self.store_offline_message(sender, recipient, message)
+                        return True, "Falha no envio direto. Mensagem armazenada para entrega posterior."
+                except Exception as e:
+                    print(f"Erro ao enviar mensagem diretamente: {e}")
+                    self.store_offline_message(sender, recipient, message)
+                    return True, "Falha no envio direto. Mensagem armazenada para entrega posterior."
             else:
                 # Usuário está longe, armazenar na fila
                 self.store_offline_message(sender, recipient, message)
@@ -118,62 +185,150 @@ class ChatServer:
     
     def store_offline_message(self, sender, recipient, message):
         """Armazena mensagem offline no RabbitMQ"""
-        try:
-            message_data = {
-                'sender': sender,
-                'recipient': recipient,
-                'message': message,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # Primeiro armazenamos localmente
-            if recipient not in self.offline_messages:
-                self.offline_messages[recipient] = []
-            
-            self.offline_messages[recipient].append(message_data)
-            
-            # Depois tentamos armazenar no RabbitMQ
+        max_retries = 3
+        current_try = 0
+        
+        while current_try < max_retries:
             try:
-                self.channel.basic_publish(
-                    exchange='',
-                    routing_key='offline_messages',
-                    body=json.dumps(message_data),
-                    properties=pika.BasicProperties(
-                        delivery_mode=2,  # Mensagem persistente
-                    )
-                )
-            except pika.exceptions.StreamLostError:
-                # Reconectar ao RabbitMQ
-                self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-                self.channel = self.connection.channel()
-                self.channel.queue_declare(queue='offline_messages')
+                if not self.ensure_connection():
+                    raise Exception("Não foi possível estabelecer conexão com RabbitMQ")
                 
-                # Tentar publicar novamente
+                message_data = {
+                    'sender': sender,
+                    'recipient': recipient,
+                    'message': message,
+                    'timestamp': datetime.now().isoformat()
+                }
+                print(f"Mensagem a ser armazenada: {message_data}")
+                
+                queue_name = f'offline_messages.{recipient}'
+                
+                # Declarar fila específica para o recipient
+                self.channel.queue_declare(
+                    queue=queue_name,
+                    durable=True
+                )
+
+                # Vincular a fila ao exchange 'chat_exchange' com a routing_key adequada
+                self.channel.queue_bind(
+                    queue=queue_name,
+                    exchange='chat_exchange',
+                    routing_key=queue_name  # A routing key deve corresponder àquela utilizada na publicação
+                )
+                
+                # Publicar mensagem
                 self.channel.basic_publish(
-                    exchange='',
-                    routing_key='offline_messages',
+                    exchange='chat_exchange',
+                    routing_key=queue_name,
                     body=json.dumps(message_data),
                     properties=pika.BasicProperties(
                         delivery_mode=2,
+                        content_type='application/json'
                     )
                 )
+                print(f"Mensagem publicada com sucesso para a fila {queue_name}")
+                return True
+                
+            except Exception as e:
+                print(f"Tentativa {current_try + 1} falhou: {e}")
+                current_try += 1
+                time.sleep(2)  # Esperar mais tempo entre tentativas
+        
+        print("Falha após todas as tentativas")
+        return False
+    
+    def setup_message_consumer(self):
+        """Configura o consumidor de mensagens"""
+        def callback(ch, method, properties, body):
+            message_data = json.loads(body)
+            recipient = message_data['recipient']
             
-            print(f"Mensagem de {sender} para {recipient} armazenada na fila")
-            return True
-        except Exception as e:
-            print(f"Erro ao armazenar mensagem offline: {e}")
-            # Mesmo com erro no RabbitMQ, a mensagem foi salva localmente
-            return True
+            if recipient not in self.offline_messages:
+                self.offline_messages[recipient] = []
+            self.offline_messages[recipient].append(message_data)
+            
+            # Confirmar processamento da mensagem
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        self.channel.basic_consume(
+            queue='offline_messages',
+            on_message_callback=callback
+        )
+        # Iniciar thread para consumir mensagens
+        threading.Thread(target=self.channel.start_consuming, daemon=True).start()
     
     def get_offline_messages(self, username):
         """Recupera mensagens offline para um usuário"""
-        if username not in self.offline_messages:
-            return []
+        messages = []
+        max_retries = 3
+        current_try = 0
         
-        messages = self.offline_messages[username]
-        # Limpar mensagens após recuperação
-        self.offline_messages[username] = []
+        while current_try < max_retries:
+            try:
+                if not self.ensure_connection():
+                    raise Exception("Não foi possível estabelecer conexão com RabbitMQ")
+                
+                queue_name = f'offline_messages.{username}'
+                
+                # Declarar fila se não existir
+                self.channel.queue_declare(
+                    queue=queue_name,
+                    durable=True
+                )
+                
+                print(f"Debug - Verificando fila {queue_name} para mensagens offline")
+                
+                # Consumir mensagens
+                while True:
+                    method_frame, header_frame, body = self.channel.basic_get(
+                        queue=queue_name,
+                        auto_ack=False
+                    )
+                    
+                    if not method_frame:
+                        break
+                    
+                    try:
+                        message_data = json.loads(body)
+                        sender = message_data['sender']
+                        
+                        if sender in self.users:
+                            distance = self.calculate_distance(
+                                self.users[sender]['location'],
+                                self.users[username]['location']
+                            )
+                            print(f"Debug - Verificando mensagem de {sender} para {username}. Distância: {distance:.2f}m")
+                            
+                            if distance <= 200:
+                                messages.append(message_data)
+                                self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                                print(f"Debug - Mensagem entregue: distância {distance:.2f}m <= 200m")
+                            else:
+                                print(f"Debug - Mensagem mantida na fila: distância {distance:.2f}m > 200m")
+                                self.channel.basic_reject(
+                                    delivery_tag=method_frame.delivery_tag,
+                                    requeue=True
+                                )
+                                break
+                        else:
+                            self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                            
+                    except Exception as e:
+                        print(f"Erro ao processar mensagem: {e}")
+                        self.channel.basic_reject(
+                            delivery_tag=method_frame.delivery_tag,
+                            requeue=True
+                        )
+                
+                print(f"Debug - Total de mensagens encontradas: {len(messages)}")
+                return messages
+                
+            except Exception as e:
+                print(f"Tentativa {current_try + 1} falhou: {e}")
+                current_try += 1
+                time.sleep(2)
         
+        print("Falha após todas as tentativas")
         return messages
     
     def user_heartbeat(self, username):
@@ -198,6 +353,22 @@ class ChatServer:
                 del self.users[username]
             
             time.sleep(60)  # Verificar a cada minuto
+    
+    def ensure_connection(self):
+        """Garante que a conexão está ativa"""
+        try:
+            if not self.connection or not self.connection.is_open:
+                print("Conexão fechada. Reconectando...")
+                return self.setup_rabbitmq_connection()
+            if not self.channel or not self.channel.is_open:
+                print("Canal fechado. Recriando...")
+                self.channel = self.connection.channel()
+                self.channel.basic_qos(prefetch_count=1)
+                return True
+            return True
+        except Exception as e:
+            print(f"Erro ao verificar conexão: {e}")
+            return False
 
 # Iniciar o servidor
 if __name__ == "__main__":

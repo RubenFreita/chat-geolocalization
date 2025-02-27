@@ -18,8 +18,8 @@ class ChatWindow:
         self.create_widgets()
         
         # Configurar thread para atualizar mensagens
-        self.message_thread = threading.Thread(target=self.update_messages, daemon=True)
-        self.message_thread.start()
+        #self.message_thread = threading.Thread(target=self.update_messages, daemon=True)
+        #self.message_thread.start()
         
         # Centralizar janela
         self.center_window()
